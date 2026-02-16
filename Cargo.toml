@@ -7,3 +7,6 @@ members = [
 ]
 
 [workspace.dependencies]
+liberror = { git = "https://github.com/charliethomson/liberror" }
+libsignal = { git = "https://github.com/charliethomson/libsignal" }
+libring = { git = "https://github.com/charliethomson/libring" }

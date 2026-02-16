@@ -335,7 +335,7 @@ impl<
     }
 }
 
-#[tracing::instrument("libffmpeg::cmd::run", skip(prepare, command, server, cancellation_token), fields(command_path = %command.as_ref().display()))]
+#[tracing::instrument("libcmd::run", skip(prepare, command, server, cancellation_token), fields(command_path = %command.as_ref().display()))]
 pub async fn run<Cmd: AsRef<Path>, Prepare>(
     command: Cmd,
     server: Option<CommandMonitorServer>,
