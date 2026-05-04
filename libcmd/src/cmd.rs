@@ -271,15 +271,27 @@ impl<
             return ControlFlow::Continue(());
         };
 
-        if let Err(e) = server.stdout_tx.send(line.clone()).await {
-            tracing::error!(
-                error = %e,
-                line = %line,
-                "Failed to send stdout line to monitor channel"
-            );
+        // The send must remain cancellable: if the consumer of the monitor
+        // channel stalls (full bounded mpsc), an unconditional `.await` here
+        // would park `tick()` outside its top-level `select!`, blocking
+        // cancellation forever. That deadlock leaves the child writing into
+        // a stdout pipe nobody is draining and the cgroup accumulates
+        // pipe_write zombies.
+        tokio::select! {
+            send_result = server.stdout_tx.send(line.clone()) => {
+                if let Err(e) = send_result {
+                    tracing::error!(
+                        error = %e,
+                        line = %line,
+                        "Failed to send stdout line to monitor channel"
+                    );
+                }
+                ControlFlow::Continue(())
+            }
+            () = self.cancellation_token.cancelled() => {
+                self.on_cancelled().await
+            }
         }
-
-        ControlFlow::Continue(())
     }
 
     #[tracing::instrument(level=Level::DEBUG, "command_context::on_stderr_line", skip(self, line), fields(line_preview = %line.chars().take(100).collect::<String>()))]
@@ -294,15 +306,21 @@ impl<
             return ControlFlow::Continue(());
         };
 
-        if let Err(e) = server.stderr_tx.send(line.clone()).await {
-            tracing::error!(
-                error = %e,
-                line = %line,
-                "Failed to send stderr line to monitor channel"
-            );
+        tokio::select! {
+            send_result = server.stderr_tx.send(line.clone()) => {
+                if let Err(e) = send_result {
+                    tracing::error!(
+                        error = %e,
+                        line = %line,
+                        "Failed to send stderr line to monitor channel"
+                    );
+                }
+                ControlFlow::Continue(())
+            }
+            () = self.cancellation_token.cancelled() => {
+                self.on_cancelled().await
+            }
         }
-
-        ControlFlow::Continue(())
     }
 
     #[tracing::instrument(level=Level::DEBUG, "command_context::tick", skip(self))]
