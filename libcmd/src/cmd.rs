@@ -423,11 +423,17 @@ where
                         "Command execution completed"
                     );
                 })
-                .inspect_err(|e| {
-                    tracing::error!(
+                .inspect_err(|e| match e {
+                    // A cancellation is a deliberate shutdown (e.g. a stall kill
+                    // or stream end), not a failure — logging it at ERROR
+                    // pollutes the error stream and inflates alerting.
+                    CommandError::Cancelled => {
+                        tracing::debug!("Command execution cancelled");
+                    }
+                    _ => tracing::error!(
                         error = %e,
                         "Command execution failed"
-                    );
+                    ),
                 });
         }
     }
