@@ -392,7 +392,9 @@ where
 
 /// Run `command` to completion.
 ///
-/// Emits one `libcmd.run` span. Failures are returned, not logged above DEBUG:
+/// Emits one DEBUG-level `libcmd.run` span: a process can live for hours, so the
+/// unit-of-work span belongs to the caller, which knows how long it should be.
+/// Failures are returned, not logged above DEBUG:
 /// the caller decides the severity (a non-zero exit is often the normal end of
 /// a live source).
 ///
@@ -404,6 +406,7 @@ where
 /// non-zero exit is not an error: inspect [`CommandExit::exit_code`].
 #[tracing::instrument(
     name = "libcmd.run",
+    level = "debug",
     skip_all,
     fields(
         command_path = %command.as_ref().display(),
