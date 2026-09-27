@@ -15,10 +15,11 @@ use tokio::{
     sync::Mutex,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::Level;
 use valuable::Valuable;
 
-use crate::{CommandExitCode, read::reader_or_never, write::writer_or_never};
+#[cfg(doc)]
+use crate::ArgsDisplay;
+use crate::{CommandExitCode, RunOptions, read::reader_or_never, write::writer_or_never};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Valuable, Error)]
 pub enum CommandError {
@@ -205,7 +206,6 @@ impl<
         }
     }
 
-    #[tracing::instrument(level=Level::DEBUG, "command_context::on_exited", skip(self))]
     fn on_exited(
         &mut self,
         exit_result: Result<ExitStatus, std::io::Error>,
@@ -213,6 +213,9 @@ impl<
         match exit_result {
             Ok(status) => {
                 self.result.exit_code = Some(status.into());
+                if let Some(code) = status.code() {
+                    tracing::Span::current().record("exit_code", code);
+                }
                 if status.success() {
                     tracing::debug!(
                         exit_code = ?status.code(),
@@ -221,18 +224,28 @@ impl<
                         "Command process completed successfully"
                     );
                 } else {
-                    tracing::error!(
+                    // A non-zero exit is routinely the normal end of a live
+                    // source (ffmpeg exits 1 when the stream goes away), so the
+                    // library doesn't judge it: the caller owns the severity.
+                    // The stderr ring can carry input URLs and is only emitted
+                    // at DEBUG.
+                    tracing::info!(
                         exit_code = ?status.code(),
                         stdout_lines = self.result.stdout_lines.len(),
                         stderr_lines = self.result.stderr_lines.len(),
-                        stderr = ?self.result.stderr_lines,
                         "Command process completed with non-zero exit code"
+                    );
+                    tracing::debug!(
+                        exit_code = ?status.code(),
+                        stderr = ?self.result.stderr_lines,
+                        "Command stderr tail"
                     );
                 }
                 ControlFlow::Break(Ok(self.result.clone()))
             }
             Err(e) => {
-                tracing::error!(
+                // Returned to the caller as `BadExit`; the caller logs it.
+                tracing::debug!(
                     error = %e,
                     "Failed to wait for command process"
                 );
@@ -243,9 +256,9 @@ impl<
         }
     }
 
-    #[tracing::instrument(level=Level::DEBUG, "command_context::on_cancelled", skip(self))]
     async fn on_cancelled(&mut self) -> ControlFlow<Result<CommandExit, CommandError>> {
-        tracing::warn!("Cancellation requested, terminating command process");
+        // Cancellation is a deliberate shutdown (stall kill, stream end).
+        tracing::debug!("Cancellation requested, terminating command process");
 
         if let Err(e) = self.child.kill().await {
             tracing::error!(
@@ -259,7 +272,6 @@ impl<
         ControlFlow::Break(Err(CommandError::Cancelled))
     }
 
-    #[tracing::instrument(level=Level::TRACE, "command_context::on_stdout_line", skip(self, line), fields(line_preview = %line.chars().take(100).collect::<String>()))]
     async fn on_stdout_line(
         &mut self,
         line: String,
@@ -280,9 +292,10 @@ impl<
         tokio::select! {
             send_result = server.stdout_tx.send(line.clone()) => {
                 if let Err(e) = send_result {
-                    tracing::error!(
+                    // The monitor client was dropped; this repeats for every
+                    // remaining line, and lines can carry input URLs.
+                    tracing::debug!(
                         error = %e,
-                        line = %line,
                         "Failed to send stdout line to monitor channel"
                     );
                 }
@@ -294,13 +307,12 @@ impl<
         }
     }
 
-    #[tracing::instrument(level=Level::DEBUG, "command_context::on_stderr_line", skip(self, line), fields(line_preview = %line.chars().take(100).collect::<String>()))]
     async fn on_stderr_line(
         &mut self,
         line: String,
     ) -> ControlFlow<Result<CommandExit, CommandError>> {
         self.result.stderr_lines.push(line.clone());
-        tracing::debug!(line = %line, "Command wrote to stderr");
+        tracing::trace!(line = %line, "Command wrote to stderr");
 
         let Some(server) = self.server.clone() else {
             return ControlFlow::Continue(());
@@ -309,9 +321,8 @@ impl<
         tokio::select! {
             send_result = server.stderr_tx.send(line.clone()) => {
                 if let Err(e) = send_result {
-                    tracing::error!(
+                    tracing::debug!(
                         error = %e,
-                        line = %line,
                         "Failed to send stderr line to monitor channel"
                     );
                 }
@@ -323,7 +334,6 @@ impl<
         }
     }
 
-    #[tracing::instrument(level=Level::DEBUG, "command_context::tick", skip(self))]
     async fn tick(&mut self) -> ControlFlow<Result<CommandExit, CommandError>> {
         tokio::select! {
             exit_result = self.child.wait() => return self.on_exited(exit_result).map_break(|r| r.map(CommandExit::from)),
@@ -353,11 +363,60 @@ impl<
     }
 }
 
-#[tracing::instrument("libcmd::run", skip(prepare, command, server, cancellation_token), fields(command_path = %command.as_ref().display()))]
+/// Run `command` to completion with default [`RunOptions`].
+///
+/// The `Executing command` log carries the program and the argument count, not
+/// the arguments; use [`run_with_options`] with an [`ArgsDisplay`] to opt in.
+///
+/// # Errors
+///
+/// See [`run_with_options`].
 pub async fn run<Cmd: AsRef<Path>, Prepare>(
     command: Cmd,
     server: Option<CommandMonitorServer>,
     cancellation_token: CancellationToken,
+    prepare: Prepare,
+) -> Result<CommandExit, CommandError>
+where
+    Prepare: FnOnce(&mut Command),
+{
+    run_with_options(
+        command,
+        server,
+        cancellation_token,
+        RunOptions::default(),
+        prepare,
+    )
+    .await
+}
+
+/// Run `command` to completion.
+///
+/// Emits one `libcmd.run` span. Failures are returned, not logged above DEBUG:
+/// the caller decides the severity (a non-zero exit is often the normal end of
+/// a live source).
+///
+/// # Errors
+///
+/// [`CommandError::BadSpawn`] if the process can't be started,
+/// [`CommandError::BadExit`] if waiting on it fails, and
+/// [`CommandError::Cancelled`] when `cancellation_token` fires first. A
+/// non-zero exit is not an error: inspect [`CommandExit::exit_code`].
+#[tracing::instrument(
+    name = "libcmd.run",
+    skip_all,
+    fields(
+        command_path = %command.as_ref().display(),
+        arg_count = tracing::field::Empty,
+        pid = tracing::field::Empty,
+        exit_code = tracing::field::Empty,
+    )
+)]
+pub async fn run_with_options<Cmd: AsRef<Path>, Prepare>(
+    command: Cmd,
+    server: Option<CommandMonitorServer>,
+    cancellation_token: CancellationToken,
+    options: RunOptions,
     prepare: Prepare,
 ) -> Result<CommandExit, CommandError>
 where
@@ -373,11 +432,23 @@ where
 
     prepare(&mut cmd);
 
-    tracing::info!(
-        command_path = %command.as_ref().display(),
-        args = ?cmd.as_std().get_args().collect::<Vec<_>>(),
-        "Executing command"
-    );
+    let args = cmd.as_std().get_args().collect::<Vec<_>>();
+    let arg_count = args.len();
+    tracing::Span::current().record("arg_count", arg_count);
+    if let Some(rendered) = options.args_display.render(&args) {
+        tracing::info!(
+            command_path = %command.as_ref().display(),
+            arg_count,
+            args = %rendered,
+            "Executing command"
+        );
+    } else {
+        tracing::info!(
+            command_path = %command.as_ref().display(),
+            arg_count,
+            "Executing command"
+        );
+    }
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -386,7 +457,8 @@ where
     let mut child = cmd
         .spawn()
         .map_err(|e| {
-            tracing::error!(
+            // Returned as `BadSpawn`; the caller logs it.
+            tracing::debug!(
                 command_path = %command.as_ref().display(),
                 error = %e,
                 "Failed to spawn command process"
@@ -396,6 +468,9 @@ where
             }
         })
         .inspect(|child| {
+            if let Some(pid) = child.id() {
+                tracing::Span::current().record("pid", pid);
+            }
             tracing::debug!(
                 pid = ?child.id(),
                 "Command process spawned successfully"
@@ -430,7 +505,8 @@ where
                     CommandError::Cancelled => {
                         tracing::debug!("Command execution cancelled");
                     }
-                    _ => tracing::error!(
+                    // Returned to the caller, which owns the error log.
+                    _ => tracing::debug!(
                         error = %e,
                         "Command execution failed"
                     ),

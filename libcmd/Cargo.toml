@@ -17,3 +17,6 @@ tokio-util = { version = "0.7.16" }
 tracing = { version = "0.1.41", features = ["valuable"] }
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 valuable = { version = "0.1.1", features = ["derive"] }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
