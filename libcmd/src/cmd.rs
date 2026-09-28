@@ -15,6 +15,7 @@ use tokio::{
     sync::Mutex,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use valuable::Valuable;
 
 #[cfg(doc)]
@@ -175,6 +176,12 @@ struct CommandContext<
     server: Option<CommandMonitorServer>,
     #[valuable(skip)]
     result: CommandExitWorking,
+    /// The `libcmd.run` span that declares `exit_code`. Recorded on directly,
+    /// never through `Span::current()`: when `libcmd.run` is filtered out
+    /// (it is DEBUG), the current span is the *caller's*, and a caller that
+    /// declares an `exit_code` field of its own would get ours written onto it.
+    #[valuable(skip)]
+    span: tracing::Span,
 }
 impl<
     StdoutReader: AsyncBufRead + Unpin + Send,
@@ -189,8 +196,10 @@ impl<
         stderr: Lines<StderrReader>,
         stdin: StdinWriter,
         cancellation_token: CancellationToken,
+        span: tracing::Span,
     ) -> Self {
         Self {
+            span,
             child,
             stdout,
             stderr,
@@ -214,7 +223,7 @@ impl<
             Ok(status) => {
                 self.result.exit_code = Some(status.into());
                 if let Some(code) = status.code() {
-                    tracing::Span::current().record("exit_code", code);
+                    self.span.record("exit_code", code);
                 }
                 if status.success() {
                     tracing::debug!(
@@ -334,12 +343,16 @@ impl<
         }
     }
 
+    // No `return` in the arms: the `select!` is this fn's tail expression, so
+    // each arm's value already is the return value, and a handler only runs
+    // after its pattern matched (a non-matching `Ok(Some(line))` disables that
+    // branch before any handler is reached either way).
     async fn tick(&mut self) -> ControlFlow<Result<CommandExit, CommandError>> {
         tokio::select! {
-            exit_result = self.child.wait() => return self.on_exited(exit_result).map_break(|r| r.map(CommandExit::from)),
-            () = self.cancellation_token.cancelled() => return self.on_cancelled().await,
-            Ok(Some(line)) = self.stdout.next_line() => return self.on_stdout_line(line).await,
-            Ok(Some(line)) = self.stderr.next_line() => return self.on_stderr_line(line).await,
+            exit_result = self.child.wait() => self.on_exited(exit_result).map_break(|r| r.map(CommandExit::from)),
+            () = self.cancellation_token.cancelled() => self.on_cancelled().await,
+            Ok(Some(line)) = self.stdout.next_line() => self.on_stdout_line(line).await,
+            Ok(Some(line)) = self.stderr.next_line() => self.on_stderr_line(line).await,
             Some(stdin_line) = async {
                 match &self.server {
                     Some(server) => server.stdin_rx.lock().await.recv().await,
@@ -404,23 +417,45 @@ where
 /// [`CommandError::BadExit`] if waiting on it fails, and
 /// [`CommandError::Cancelled`] when `cancellation_token` fires first. A
 /// non-zero exit is not an error: inspect [`CommandExit::exit_code`].
-#[tracing::instrument(
-    name = "libcmd.run",
-    level = "debug",
-    skip_all,
-    fields(
-        command_path = %command.as_ref().display(),
-        arg_count = tracing::field::Empty,
-        pid = tracing::field::Empty,
-        exit_code = tracing::field::Empty,
-    )
-)]
 pub async fn run_with_options<Cmd: AsRef<Path>, Prepare>(
     command: Cmd,
     server: Option<CommandMonitorServer>,
     cancellation_token: CancellationToken,
     options: RunOptions,
     prepare: Prepare,
+) -> Result<CommandExit, CommandError>
+where
+    Prepare: FnOnce(&mut Command),
+{
+    // Built by hand (not `#[instrument]`) so the body holds the handle: every
+    // `record` targets this span, which is a no-op when it's filtered out
+    // rather than a write onto whatever span the caller has current.
+    let span = tracing::debug_span!(
+        "libcmd.run",
+        command_path = %command.as_ref().display(),
+        arg_count = tracing::field::Empty,
+        pid = tracing::field::Empty,
+        exit_code = tracing::field::Empty,
+    );
+    run_in_span(
+        command,
+        server,
+        cancellation_token,
+        options,
+        prepare,
+        span.clone(),
+    )
+    .instrument(span)
+    .await
+}
+
+async fn run_in_span<Cmd: AsRef<Path>, Prepare>(
+    command: Cmd,
+    server: Option<CommandMonitorServer>,
+    cancellation_token: CancellationToken,
+    options: RunOptions,
+    prepare: Prepare,
+    span: tracing::Span,
 ) -> Result<CommandExit, CommandError>
 where
     Prepare: FnOnce(&mut Command),
@@ -437,7 +472,7 @@ where
 
     let args = cmd.as_std().get_args().collect::<Vec<_>>();
     let arg_count = args.len();
-    tracing::Span::current().record("arg_count", arg_count);
+    span.record("arg_count", arg_count);
     if let Some(rendered) = options.args_display.render(&args) {
         tracing::info!(
             command_path = %command.as_ref().display(),
@@ -472,7 +507,7 @@ where
         })
         .inspect(|child| {
             if let Some(pid) = child.id() {
-                tracing::Span::current().record("pid", pid);
+                span.record("pid", pid);
             }
             tracing::debug!(
                 pid = ?child.id(),
@@ -490,7 +525,15 @@ where
 
     tracing::trace!("Starting command event loop");
 
-    let mut context = CommandContext::new(child, server, stdout, stderr, stdin, cancellation_token);
+    let mut context = CommandContext::new(
+        child,
+        server,
+        stdout,
+        stderr,
+        stdin,
+        cancellation_token,
+        span,
+    );
 
     loop {
         if let ControlFlow::Break(result) = context.tick().await {
