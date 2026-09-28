@@ -24,9 +24,19 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
-/// Every `(span name, field name)` pair recorded after span creation.
+/// Every `(span name, field name)` pair recorded after span creation, plus
+/// the visitor method each value arrived through.
 #[derive(Clone, Default)]
-struct Recorded(Arc<Mutex<Vec<(String, String)>>>);
+struct Recorded(Arc<Mutex<Vec<(String, String, Kind)>>>);
+
+/// Which `Visit` method a value arrived through. tracing-opentelemetry has
+/// no `record_u64`, so an unsigned value reaches the exporter as a string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    I64,
+    U64,
+    Other,
+}
 
 impl Recorded {
     fn on(&self, span: &str) -> Vec<String> {
@@ -35,19 +45,40 @@ impl Recorded {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(s, _)| s == span)
-            .map(|(_, f)| f.clone())
+            .filter(|(s, _, _)| s == span)
+            .map(|(_, f, _)| f.clone())
             .collect();
         fields.sort();
         fields
     }
+
+    fn kinds(&self, span: &str) -> Vec<(String, Kind)> {
+        let mut fields: Vec<(String, Kind)> = self
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(s, _, _)| s == span)
+            .map(|(_, f, k)| (f.clone(), *k))
+            .collect();
+        fields.sort_by(|a, b| a.0.cmp(&b.0));
+        fields
+    }
 }
 
-struct FieldNames(Vec<String>);
+struct FieldNames(Vec<(String, Kind)>);
 
 impl Visit for FieldNames {
+    fn record_i64(&mut self, field: &Field, _: i64) {
+        self.0.push((field.name().to_string(), Kind::I64));
+    }
+
+    fn record_u64(&mut self, field: &Field, _: u64) {
+        self.0.push((field.name().to_string(), Kind::U64));
+    }
+
     fn record_debug(&mut self, field: &Field, _: &dyn std::fmt::Debug) {
-        self.0.push(field.name().to_string());
+        self.0.push((field.name().to_string(), Kind::Other));
     }
 }
 
@@ -57,7 +88,7 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Recorded {
         let mut fields = FieldNames(Vec::new());
         values.record(&mut fields);
         let mut out = self.0.lock().unwrap();
-        out.extend(fields.0.into_iter().map(|f| (name.clone(), f)));
+        out.extend(fields.0.into_iter().map(|(f, k)| (name.clone(), f, k)));
     }
 }
 
@@ -105,6 +136,22 @@ async fn enabled_run_span_records_on_itself() {
     exit_3().await;
     assert_eq!(recorded.on("caller"), Vec::<String>::new());
     assert_eq!(recorded.on("libcmd.run"), ["arg_count", "exit_code", "pid"]);
+}
+
+/// Span numbers are i64 so they export as OTLP ints, not strings (TTR-64).
+#[cfg(unix)]
+#[tokio::test]
+async fn run_span_numbers_are_i64() {
+    let (recorded, _guard) = subscriber(LevelFilter::DEBUG);
+    exit_3().await;
+    assert_eq!(
+        recorded.kinds("libcmd.run"),
+        [
+            ("arg_count".to_string(), Kind::I64),
+            ("exit_code".to_string(), Kind::I64),
+            ("pid".to_string(), Kind::I64),
+        ]
+    );
 }
 
 /// The event loop's arms return their value as the `select!`'s tail

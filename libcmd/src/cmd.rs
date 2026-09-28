@@ -472,7 +472,9 @@ where
 
     let args = cmd.as_std().get_args().collect::<Vec<_>>();
     let arg_count = args.len();
-    span.record("arg_count", arg_count);
+    // Span numbers are i64: tracing-opentelemetry exports unsigned ints as
+    // strings, which TraceQL can't compare (TTR-64).
+    span.record("arg_count", i64::try_from(arg_count).unwrap_or(i64::MAX));
     if let Some(rendered) = options.args_display.render(&args) {
         tracing::info!(
             command_path = %command.as_ref().display(),
@@ -507,7 +509,7 @@ where
         })
         .inspect(|child| {
             if let Some(pid) = child.id() {
-                span.record("pid", pid);
+                span.record("pid", i64::from(pid));
             }
             tracing::debug!(
                 pid = ?child.id(),
